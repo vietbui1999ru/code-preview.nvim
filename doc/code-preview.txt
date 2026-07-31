@@ -8,7 +8,8 @@ CONTENTS                                                *code-preview-contents*
   3. Configuration .......................... |code-preview-config|
   4. Commands ............................... |code-preview-commands|
   5. Keymaps ................................ |code-preview-keymaps|
-  6. Agents ................................. |code-preview-agents|
+  6. Lua API ................................ |code-preview-api|
+  7. Agents ................................. |code-preview-agents|
 
 ==============================================================================
 1. INTRODUCTION                                     *code-preview-introduction*
@@ -86,10 +87,11 @@ Full default configuration. These values are copied verbatim from
       },
       keys = {
         -- Set any entry to false to skip that binding. Set `keys = false` to skip all.
-        -- <Plug>(CodePreviewCloseAll) is always defined so users can map it themselves.
-        next_change = "]c",        -- buffer-local in inline diff buffers
-        prev_change = "[c",        -- buffer-local in inline diff buffers
-        close_all   = "<leader>dq", -- global; close diff and clear indicators
+        -- <Plug> mappings are always defined so users can map them themselves.
+        next_change  = "]c",         -- buffer-local in inline diff buffers
+        prev_change  = "[c",         -- buffer-local in inline diff buffers
+        toggle_layout = "<leader>dt", -- buffer-local in all preview buffers
+        close_all    = "<leader>dq",  -- global; close diff and clear indicators
       },
       highlights = {
         current = {
@@ -127,6 +129,11 @@ diff.layouts        Per-agent layout override, keyed by agent id:
                     not listed falls back to `diff.layout`.
                     Example: `layouts = { codex = "inline" }`.
 
+                    Use |:CodePreviewToggleLayout| or the buffer-local
+                    `<leader>dt` mapping to switch one active preview between
+                    inline and its original "tab"/"vsplit" layout. A preview
+                    configured as "inline" uses "tab" for its side view.
+
 diff.visible_only   When true, suppress previews for files not visible in any
                     Neovim window. Change indicators still fire. Toggle at
                     runtime with `:CodePreviewToggleVisibleOnly`.
@@ -142,10 +149,12 @@ neo_tree            Soft dependency. If neo-tree is not installed these
                     indicators but stops scrolling the tree to the file.
 
 keys                Set any entry to false to skip that binding, or
-                    `keys = false` to skip them all. `<Plug>(CodePreviewCloseAll)`
-                    is always defined so it can be mapped manually: >lua
+                    `keys = false` to skip them all. The `<Plug>` mappings are
+                    always defined so they can be mapped manually: >lua
                         vim.keymap.set("n", "<leader>x",
                           "<Plug>(CodePreviewCloseAll)")
+                        vim.keymap.set("n", "<leader>t",
+                          "<Plug>(CodePreviewToggleLayout)")
 <
 ==============================================================================
 4. COMMANDS                                             *code-preview-commands*
@@ -187,6 +196,11 @@ keys                Set any entry to false to skip that binding, or
 :CodePreviewCloseDiff
                     Manually close the diff. Use after rejecting a change.
 
+                                              *:CodePreviewToggleLayout*
+:CodePreviewToggleLayout [file]
+                    Toggle one active preview between inline and side-by-side.
+                    With no file, infer the preview from the current buffer.
+
                                                        *:CodePreviewStatus*
 :CodePreviewStatus
                     Show socket path, hook status, and a dependency check.
@@ -207,6 +221,7 @@ Defaults (all configurable via the `keys` table, see |code-preview-config|):
 
   <leader>dq    global              Close the diff and clear indicators
                                     (same as `:CodePreviewCloseDiff`).
+  <leader>dt    preview buffer      Toggle inline/side-by-side for this preview.
   ]c            inline diff buffer  Jump to the next change.
   [c            inline diff buffer  Jump to the previous change.
 
@@ -214,8 +229,56 @@ Defaults (all configurable via the `keys` table, see |code-preview-config|):
 A `<Plug>(CodePreviewCloseAll)` mapping is always defined, regardless of the
 `keys` config, so it can be bound manually even with `keys = false`.
 
+                                        *<Plug>(CodePreviewToggleLayout)*
+A `<Plug>(CodePreviewToggleLayout)` mapping is also always defined. The default
+`keys.toggle_layout` binding invokes it buffer-locally in every preview buffer.
+
 ==============================================================================
-6. AGENTS                                                 *code-preview-agents*
+6. LUA API                                                   *code-preview-api*
+
+                                             *code-preview.diff.toggle_layout()*
+require("code-preview.diff").toggle_layout({file_path})
+                    Toggle only the named active preview. If {file_path} is
+                    omitted, infer it from the current preview buffer. Returns
+                    true when a preview was toggled, false otherwise. Content
+                    comes from the preview's in-memory snapshots, so source
+                    tempfiles may already have been deleted. Toggling does not
+                    change indicators or invoke neo-tree reveal.
+
+                                               *code-preview.diff.get_context()*
+require("code-preview.diff").get_context({opts})
+                    Return context for an active preview buffer, or nil outside
+                    one. {opts} is optional and accepts `bufnr`, `start_line`,
+                    and `end_line`; defaults are the current buffer and cursor
+                    line. The result has this shape: >lua
+                        {
+                          file_path = string,
+                          display_path = string,
+                          layout = "tab" | "vsplit" | "inline",
+                          side = "original" | "proposed" | "inline",
+                          bufnr = number,
+                          cursor = {
+                            line = number, column = number,
+                            old_line = number?, new_line = number?,
+                          },
+                          range = { start_line = number, end_line = number },
+                          selected_lines = { string, ... },
+                          selected_text = string,
+                          line_mappings = {
+                            {
+                              buffer_line = number,
+                              old_line = number?, new_line = number?,
+                            },
+                            ...
+                          },
+                        }
+<
+                    Lines are 1-based and `cursor.column` is Neovim's 0-based
+                    byte column. Missing old/new numbers identify added/removed
+                    lines.
+
+==============================================================================
+7. AGENTS                                                 *code-preview-agents*
 
 After |code-preview.setup()|, install hooks for your agent and restart its
 CLI. The diff/review experience is identical across agents.

@@ -36,10 +36,11 @@ local default_config = {
   },
   keys = {
     -- Set any entry to false to skip that binding. Set `keys = false` to skip all.
-    -- <Plug>(CodePreviewCloseAll) is always defined so users can map it themselves.
-    next_change = "]c",        -- buffer-local in inline diff buffers
-    prev_change = "[c",        -- buffer-local in inline diff buffers
-    close_all   = "<leader>dq", -- global; close diff and clear indicators
+    -- <Plug> mappings are always defined so users can map them themselves.
+    next_change  = "]c",         -- buffer-local in inline diff buffers
+    prev_change  = "[c",         -- buffer-local in inline diff buffers
+    toggle_layout = "<leader>dt", -- buffer-local in all preview buffers
+    close_all    = "<leader>dq",  -- global; close diff and clear indicators
   },
   highlights = {
     current = {
@@ -127,6 +128,15 @@ function M.setup(user_config)
     require("code-preview.diff").close_diff_and_clear()
   end, { desc = "Manually close code-preview diff (use after rejecting a change)" })
 
+  vim.api.nvim_create_user_command("CodePreviewToggleLayout", function(command)
+    local file_path = command.args ~= "" and command.args or nil
+    require("code-preview.diff").toggle_layout(file_path)
+  end, {
+    nargs = "?",
+    complete = "file",
+    desc = "Toggle the current code-preview between inline and side-by-side",
+  })
+
   vim.api.nvim_create_user_command("CodePreviewStatus", function()
     M.status()
   end, { desc = "Show code-preview status" })
@@ -150,6 +160,9 @@ function M.setup(user_config)
   vim.keymap.set("n", "<Plug>(CodePreviewCloseAll)", function()
     require("code-preview.diff").close_diff_and_clear()
   end, { desc = "Close code-preview diff" })
+  vim.keymap.set("n", "<Plug>(CodePreviewToggleLayout)", function()
+    require("code-preview.diff").toggle_layout()
+  end, { desc = "Toggle code-preview layout" })
 
   if M.config.keys ~= false then
     local close_all = M.config.keys and M.config.keys.close_all

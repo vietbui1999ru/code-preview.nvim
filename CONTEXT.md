@@ -152,6 +152,16 @@ The plugin doesn't *implement* the gate; it lives inside the agent. The plugin's
 
 The user-facing config value (`diff.layout`) that selects how a [preview](#preview) is rendered. Three values: `"tab"`, `"vsplit"`, `"inline"`. The first two share one [renderer](#renderer); `"inline"` uses the other.
 
+## Runtime layout toggle
+
+The per-preview switch between the unified and side-by-side [renderers](#renderer). `diff.toggle_layout(file_path?)`, `:CodePreviewToggleLayout`, and `<Plug>(CodePreviewToggleLayout)` all operate on one active preview; when the file path is omitted, the preview is inferred from the current preview buffer. A preview that started as `"tab"` or `"vsplit"` returns to that original side-by-side layout. A preview configured as `"inline"` uses `"tab"` as its side-by-side alternative.
+
+Toggling is a rendering operation, not a new [proposal](#proposal) or lifecycle transition. Each active preview retains immutable original/proposed line snapshots and its file/display/layout metadata, so toggling does not reread source tempfiles, mark or clear a [change](#change), or trigger [reveal](#reveal). Cursor positions are translated through the preview's old/new line mapping where possible.
+
+## Preview context
+
+Structured information about the preview buffer under review, returned by `diff.get_context(opts?)`. The optional `bufnr`, `start_line`, and `end_line` inputs select a preview buffer and range; the current buffer/cursor line are used by default. The result identifies the file path, display path, layout, and side (`original`, `proposed`, or `inline`), and includes cursor data, the selected range/text/lines, and per-line old/new mappings. It returns `nil` for buffers outside active previews. This is a plugin-level API for editor and agent integrations; it is not coupled to any particular client.
+
 ## Renderer
 
 The internal rendering path. Two of them:

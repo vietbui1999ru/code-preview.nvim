@@ -40,15 +40,19 @@ Your AI coding agent proposes edits in its terminal — a cramped, scroll-past d
 <summary><b>📺 More demos</b></summary>
 
 ### OpenCode
+
 ![OpenCode demo](assets/code-preview-opencode.gif)
 
 ### GitHub Copilot CLI
+
 ![GitHub Copilot CLI demo](assets/code-preview-copilot.gif)
 
 ### OpenAI Codex CLI
+
 ![OpenAI Codex CLI demo](assets/code-preview-codex.gif)
 
 ### Neo-tree integration
+
 ![neo-tree integration demo](assets/code-preview-neotree-integration.gif)
 
 </details>
@@ -189,6 +193,8 @@ require("code-preview").setup({
 | `"vsplit"` | Side-by-side as a vertical split in the current tab |
 | `"inline"` | GitHub-style unified diff in one buffer, syntax highlighting preserved, `]c` / `[c` to navigate |
 
+While reviewing, press `<leader>dt` or run `:CodePreviewToggleLayout` to switch only the current preview between inline and its configured `tab`/`vsplit` layout. Inline-configured previews use a tab for their side-by-side view. The preview keeps content snapshots in memory, so the switch remains available after hook tempfiles are removed.
+
 You can also set the layout **per agent** — e.g. inline for Codex, a tab for everything else:
 
 ```lua
@@ -229,6 +235,7 @@ A realistic, opinionated lazy.nvim spec — inline diffs everywhere, a per-agent
 |---------|-------------|
 | `:CodePreviewInstall…Hooks` / `:CodePreviewUninstall…Hooks` | Install/remove hooks for an agent (`ClaudeCode`, `OpenCode`, `CopilotCli`, `CodexCli`) |
 | `:CodePreviewCloseDiff` | Manually close the diff (use after rejecting) |
+| `:CodePreviewToggleLayout [file]` | Toggle one preview between inline and side-by-side |
 | `:CodePreviewStatus` | Show socket path, hook status, and dependency check |
 | `:CodePreviewToggleVisibleOnly` | Toggle `visible_only` — diffs only for open buffers |
 | `:checkhealth code-preview` | Full health check (all agents) |
@@ -236,6 +243,7 @@ A realistic, opinionated lazy.nvim spec — inline diffs everywhere, a per-agent
 | Key | Scope | Description |
 |-----|-------|-------------|
 | `<leader>dq` | global | Close the diff (same as `:CodePreviewCloseDiff`) |
+| `<leader>dt` | preview buffer | Toggle the current preview layout |
 | `]c` | inline diff buffer | Jump to next change |
 | `[c` | inline diff buffer | Jump to previous change |
 
@@ -298,34 +306,41 @@ vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter", "CursorHold" }, {
 <summary><b>Troubleshooting</b></summary>
 
 **Diff doesn't open**
+
 - `:CodePreviewStatus` — check that `Neovim socket` is found
 - `:checkhealth code-preview` — check for missing dependencies
 - Enable `debug = true` and check `~/.local/state/nvim/code-preview.log`
 - Restart the CLI agent after installing hooks (hooks are read at startup)
 
 **Claude Code hooks not firing**
+
 - Re-run `:CodePreviewInstallClaudeCodeHooks` in the project root
 - Verify `.claude/settings.local.json` contains the hook entries; ensure `jq` is in PATH; restart the CLI
 
 **OpenCode plugin not loading**
+
 - Re-run `:CodePreviewInstallOpenCodeHooks`; verify `.opencode/plugins/index.ts` exists
 - Ensure `"permission": { "edit": "ask" }` is set in `~/.config/opencode/opencode.json`; restart OpenCode
 
 **Codex CLI hooks not firing**
+
 - Re-run `:CodePreviewInstallCodexCliHooks`
 - Confirm `.codex/config.toml` does **not** contain `[features] hooks = false` (or the legacy `codex_hooks = false`)
 - Older Codex required `codex_hooks = true` and only fired hooks for `Bash`, not `apply_patch` — update if needed
 - `:CodePreviewStatus` / `:checkhealth code-preview` report install state and the feature flag
 
 **Copilot CLI hooks not firing**
+
 - Re-run `:CodePreviewInstallCopilotCliHooks`; verify `.github/hooks/code-preview.json` exists
 - Ensure `jq` is in PATH (macOS/Linux). On Windows, Copilot runs the hook under pwsh 7+ — if it silently doesn't fire, check `Get-ExecutionPolicy` (`RemoteSigned` works; `Restricted`/`AllSigned` blocks it)
 - Restart Copilot CLI
 
 **Diff doesn't close after rejecting**
+
 - Press `<leader>dq` or run `:CodePreviewCloseDiff` — the post hook only fires on accept (Claude Code & Copilot CLI)
 
 **Migrating from older versions**
+
 - Update `require("claude-preview")` → `require("code-preview")` in your config
 - Re-run `:CodePreviewInstallClaudeCodeHooks` to update hook paths
 - The old `:ClaudePreview*` commands were removed — use the `:CodePreview*` equivalents

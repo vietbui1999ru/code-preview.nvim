@@ -2,8 +2,9 @@ local M = {}
 
 local log = require("code-preview.log")
 
--- Active diffs keyed by absolute file path.
--- Each entry: { tab, bufs, augroup, inline_win }
+-- Active previews keyed by absolute file path. Each entry owns immutable
+-- original/proposed line snapshots plus the metadata and UI resources needed to
+-- re-render that one preview without consulting its source tempfiles.
 local active_diffs = {}
 
 -- Per-buffer inline diff state (line numbers, types) for statuscolumn.
@@ -226,9 +227,7 @@ local function char_diff_ranges(old_line, new_line)
   return prefix, #old_line - suffix, #new_line - suffix
 end
 
-local function build_inline_diff(original_path, proposed_path)
-  local orig_lines = read_file_lines(original_path)
-  local prop_lines = read_file_lines(proposed_path)
+local function build_inline_diff(orig_lines, prop_lines)
   local orig_text = #orig_lines > 0 and (table.concat(orig_lines, "\n") .. "\n") or ""
   local prop_text = #prop_lines > 0 and (table.concat(prop_lines, "\n") .. "\n") or ""
 
@@ -238,7 +237,11 @@ local function build_inline_diff(original_path, proposed_path)
   })
 
   if not diff_str or diff_str == "" then
-    return prop_lines, {}, {}, {}, {}
+    local line_numbers = {}
+    for lnum = 1, #prop_lines do
+      line_numbers[lnum] = { lnum, lnum }
+    end
+    return vim.deepcopy(prop_lines), {}, {}, line_numbers, {}
   end
 
   local display_lines = {}
@@ -249,9 +252,10 @@ local function build_inline_diff(original_path, proposed_path)
 
   local entries = {}
   for line in diff_str:gmatch("([^\n]*)\n?") do
-    if line:sub(1, 3) == "---" or line:sub(1, 3) == "+++" then
-      -- skip
-    elseif line:sub(1, 2) == "@@" then
+    -- vim.diff unified output starts with hunk headers and has no ---/+++
+    -- file headers. A record beginning --- or +++ is therefore real changed
+    -- content whose source text begins -- or ++.
+    if line:sub(1, 2) == "@@" then
       -- skip hunk headers
     elseif line:sub(1, 1) == "-" then
       table.insert(entries, { type = "removed", text = line:sub(2) })
@@ -339,14 +343,24 @@ local function build_inline_diff(original_path, proposed_path)
   return display_lines, line_highlights, char_highlights, line_numbers, line_types
 end
 
---- Create an inline diff tab and return {tab, bufs, inline_win}.
-local function show_inline_diff(original_path, proposed_path, real_file_path, cfg)
+local function set_toggle_keymap(buf, cfg)
+  local keys_cfg = cfg and cfg.keys
+  if keys_cfg ~= false and keys_cfg and keys_cfg.toggle_layout then
+    vim.keymap.set("n", keys_cfg.toggle_layout, "<Plug>(CodePreviewToggleLayout)", {
+      buffer = buf,
+      desc = "Toggle code-preview layout",
+    })
+  end
+end
+
+--- Create an inline diff tab and return its UI resources.
+local function show_inline_diff(entry, cfg)
   apply_inline_highlights(cfg)
 
-  local display_name = real_file_path or "unknown"
-  local ft = vim.filetype.match({ filename = real_file_path }) or ""
+  local display_name = entry.display_path or "unknown"
+  local ft = vim.filetype.match({ filename = entry.file_path or entry.display_path }) or ""
   local display_lines, line_highlights, char_highlights, line_numbers, line_types =
-    build_inline_diff(original_path, proposed_path)
+    build_inline_diff(entry.original_lines, entry.proposed_lines)
 
   vim.cmd("tabnew")
   local tab = vim.api.nvim_get_current_tabpage()
@@ -394,8 +408,8 @@ local function show_inline_diff(original_path, proposed_path, real_file_path, cf
   local col_width = math.max(#tostring(max_num), 1)
 
   local n = active_count()
-  local winbar_prefix = n > 0
-    and string.format("%%#DiagnosticInfo# DIFF [%d pending] %%* ", n + 1)
+  local winbar_prefix = n > 1
+    and string.format("%%#DiagnosticInfo# DIFF [%d pending] %%* ", n)
     or "%#DiagnosticInfo# INLINE DIFF %* "
   vim.wo[win].winbar = winbar_prefix .. display_name
   vim.wo[win].number = false
@@ -440,81 +454,68 @@ local function show_inline_diff(original_path, proposed_path, real_file_path, cf
     end
   end
 
+  set_toggle_keymap(buf, cfg)
+
   if first_change_line then
     vim.api.nvim_win_set_cursor(win, { first_change_line, 0 })
   end
 
-  return { tab = tab, bufs = { buf }, inline_win = win }
+  return {
+    tab = tab,
+    bufs = { buf },
+    wins = { win },
+    inline_win = win,
+    inline_line_numbers = line_numbers,
+    inline_line_types = line_types,
+  }
 end
 
-function M.show_diff(original_path, proposed_path, real_file_path, abs_file_path, action, backend)
-  local file_key = abs_file_path or real_file_path
-  local cfg = require("code-preview").config
-  local layout = layout_for_backend(cfg, backend)
-  log.info(log.fmt("show_diff: file=%s layout=%s backend=%s active=%d",
-    file_key or "nil",
-    layout,
-    backend or "nil",
-    active_count()))
-
-  -- If a diff for this SAME file is already open, close it first (re-edit)
-  if file_key and active_diffs[file_key] then
-    log.debug(log.fmt("show_diff: re-edit detected, closing existing diff for %s", file_key))
-    M.close_for_file(file_key)
-  end
-
-  -- Set the neo-tree indicator + reveal
-  mark_change_and_reveal(abs_file_path, action)
-
-  -- Inline layout
-  if layout == "inline" then
-    local result = show_inline_diff(original_path, proposed_path, real_file_path, cfg)
-    active_diffs[file_key] = result
-    -- Force terminal redraw so RPC-triggered tab creation is visible (see force_redraw).
-    force_redraw()
-    return
-  end
-
-  -- Side-by-side / tab layout
+local function show_side_diff(entry, cfg, layout)
   apply_highlights(cfg)
 
-  local display_name = real_file_path or "unknown"
+  local display_name = entry.display_path or "unknown"
   local labels = cfg.diff.labels or { current = "CURRENT", proposed = "PROPOSED" }
-  local ft = vim.filetype.match({ filename = real_file_path }) or ""
+  local ft = vim.filetype.match({ filename = entry.file_path or entry.display_path }) or ""
 
+  local orig_buf
   if layout == "vsplit" then
+    if entry.host_win and vim.api.nvim_win_is_valid(entry.host_win) then
+      vim.api.nvim_set_current_win(entry.host_win)
+    end
     vim.cmd("vsplit")
+    -- A split initially shares its source buffer. Replace it with a scratch
+    -- buffer so preview teardown never wipes or mutates the user's host buffer.
+    orig_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_win_set_buf(0, orig_buf)
   else
     vim.cmd("tabnew")
+    orig_buf = vim.api.nvim_get_current_buf()
   end
   local tab = vim.api.nvim_get_current_tabpage()
 
-  -- Left side: CURRENT
-  local orig_buf = vim.api.nvim_get_current_buf()
-  vim.api.nvim_buf_set_lines(orig_buf, 0, -1, false, read_file_lines(original_path))
-  vim.bo[orig_buf].buftype    = "nofile"
-  vim.bo[orig_buf].bufhidden  = "wipe"
-  vim.bo[orig_buf].swapfile   = false
+  vim.api.nvim_buf_set_lines(orig_buf, 0, -1, false, entry.original_lines)
+  vim.bo[orig_buf].buftype = "nofile"
+  vim.bo[orig_buf].bufhidden = "wipe"
+  vim.bo[orig_buf].swapfile = false
   vim.bo[orig_buf].modifiable = false
   if ft ~= "" then vim.bo[orig_buf].filetype = ft end
 
   local orig_win = vim.api.nvim_get_current_win()
   local n = active_count()
-  local winbar_prefix = n > 0
-    and string.format("%%#DiagnosticError# %s [%d pending] %%* ", labels.current, n + 1)
+  local winbar_prefix = n > 1
+    and string.format("%%#DiagnosticError# %s [%d pending] %%* ", labels.current, n)
     or "%#DiagnosticError# " .. labels.current .. " %* "
   vim.wo[orig_win].winbar = winbar_prefix .. display_name
   vim.api.nvim_win_set_hl_ns(orig_win, current_ns)
   vim.cmd("diffthis")
 
-  -- Right side: PROPOSED
   vim.cmd("rightbelow vsplit")
   local prop_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_win_set_buf(0, prop_buf)
-  vim.api.nvim_buf_set_lines(prop_buf, 0, -1, false, read_file_lines(proposed_path))
-  vim.bo[prop_buf].buftype    = "nofile"
-  vim.bo[prop_buf].bufhidden  = "wipe"
-  vim.bo[prop_buf].swapfile   = false
+  vim.api.nvim_buf_set_lines(prop_buf, 0, -1, false, entry.proposed_lines)
+  vim.bo[prop_buf].buftype = "nofile"
+  vim.bo[prop_buf].bufhidden = "wipe"
+  vim.bo[prop_buf].swapfile = false
   vim.bo[prop_buf].modifiable = false
   if ft ~= "" then vim.bo[prop_buf].filetype = ft end
 
@@ -523,27 +524,26 @@ function M.show_diff(original_path, proposed_path, real_file_path, abs_file_path
   vim.api.nvim_win_set_hl_ns(prop_win, proposed_ns)
   vim.cmd("diffthis")
 
-  local bufs = { orig_buf, prop_buf }
+  for _, buf in ipairs({ orig_buf, prop_buf }) do
+    set_toggle_keymap(buf, cfg)
+  end
 
   if cfg.diff.full_file then
     for _, win in ipairs({ orig_win, prop_win }) do
-      vim.wo[win].foldenable  = true
-      vim.wo[win].foldmethod  = "diff"
-      vim.wo[win].foldlevel   = 999
-      vim.wo[win].foldcolumn  = "0"
+      vim.wo[win].foldenable = true
+      vim.wo[win].foldmethod = "diff"
+      vim.wo[win].foldlevel = 999
+      vim.wo[win].foldcolumn = "0"
     end
   end
 
-  if cfg.diff.equalize then
-    vim.cmd("wincmd =")
-  end
+  if cfg.diff.equalize then vim.cmd("wincmd =") end
 
-  local augroup = vim.api.nvim_create_augroup("CodePreviewDiffResize_" .. file_key, { clear = true })
+  local augroup = vim.api.nvim_create_augroup("CodePreviewDiffResize_" .. entry.file_path, { clear = true })
   vim.api.nvim_create_autocmd("VimResized", {
     group = augroup,
     callback = function()
       if cfg.diff.equalize
-        and tab
         and vim.api.nvim_tabpage_is_valid(tab)
         and vim.api.nvim_get_current_tabpage() == tab
       then
@@ -552,10 +552,270 @@ function M.show_diff(original_path, proposed_path, real_file_path, abs_file_path
     end,
   })
 
-  active_diffs[file_key] = { tab = tab, bufs = bufs, augroup = augroup }
-
   vim.cmd("normal! ]c")
+  return {
+    tab = tab,
+    bufs = { orig_buf, prop_buf },
+    wins = { orig_win, prop_win },
+    orig_buf = orig_buf,
+    prop_buf = prop_buf,
+    orig_win = orig_win,
+    prop_win = prop_win,
+    augroup = augroup,
+  }
+end
 
+local RESOURCE_KEYS = {
+  "tab", "bufs", "wins", "inline_win", "inline_line_numbers", "inline_line_types",
+  "orig_buf", "prop_buf", "orig_win", "prop_win", "augroup",
+}
+
+local function destroy_render(entry)
+  for _, win in ipairs(entry.wins or {}) do
+    if vim.api.nvim_win_is_valid(win) then
+      pcall(vim.api.nvim_win_call, win, function() vim.cmd("diffoff") end)
+    end
+  end
+  for _, win in ipairs(entry.wins or {}) do
+    if vim.api.nvim_win_is_valid(win) then
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+  end
+  for _, buf in ipairs(entry.bufs or {}) do
+    buf_inline_data[buf] = nil
+    if vim.api.nvim_buf_is_valid(buf) then
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+  end
+  if entry.augroup then pcall(vim.api.nvim_del_augroup_by_id, entry.augroup) end
+  for _, key in ipairs(RESOURCE_KEYS) do entry[key] = nil end
+end
+
+local function render_entry(entry, layout)
+  local cfg = require("code-preview").config
+  local resources
+  if layout == "inline" then
+    resources = show_inline_diff(entry, cfg)
+  else
+    resources = show_side_diff(entry, cfg, layout)
+  end
+  for key, value in pairs(resources) do entry[key] = value end
+  entry.layout = layout
+end
+
+local function entry_for_buffer(bufnr)
+  for file_path, entry in pairs(active_diffs) do
+    for _, buf in ipairs(entry.bufs or {}) do
+      if buf == bufnr and vim.api.nvim_buf_is_valid(buf) then
+        local side = "inline"
+        if buf == entry.orig_buf then side = "original" end
+        if buf == entry.prop_buf then side = "proposed" end
+        return file_path, entry, side
+      end
+    end
+  end
+end
+
+local function line_pair(entry, side, lnum)
+  if side == "inline" then
+    local pair = entry.inline_line_numbers and entry.inline_line_numbers[lnum]
+    return pair and pair[1] or nil, pair and pair[2] or nil
+  end
+
+  local wanted_index = side == "original" and 1 or 2
+  local snapshot_length = side == "original" and #entry.original_lines or #entry.proposed_lines
+  if lnum > snapshot_length then return nil, nil end
+
+  local wanted = lnum
+  for _, pair in ipairs(entry.line_numbers or {}) do
+    if pair[wanted_index] == wanted then return pair[1], pair[2] end
+  end
+  if side == "original" then return lnum, nil end
+  if side == "proposed" then return nil, lnum end
+  return nil, nil
+end
+
+local function window_for_buffer(bufnr)
+  for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+      if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == bufnr then
+        return win
+      end
+    end
+  end
+end
+
+--- Return structured information for a preview buffer, or nil outside a preview.
+--- opts accepts bufnr, start_line, and end_line.
+function M.get_context(opts)
+  opts = opts or {}
+  local bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(bufnr) then return nil end
+
+  local _, entry, side = entry_for_buffer(bufnr)
+  if not entry then return nil end
+
+  local cursor_line, cursor_col = 1, 0
+  local win = window_for_buffer(bufnr)
+  if win then
+    local cursor = vim.api.nvim_win_get_cursor(win)
+    cursor_line, cursor_col = cursor[1], cursor[2]
+  end
+
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  local start_line = math.max(1, math.min(opts.start_line or cursor_line, line_count))
+  local end_line = math.max(1, math.min(opts.end_line or start_line, line_count))
+  if start_line > end_line then start_line, end_line = end_line, start_line end
+
+  local selected_lines = vim.api.nvim_buf_get_lines(bufnr, start_line - 1, end_line, false)
+  local mappings = {}
+  for lnum = start_line, end_line do
+    local old_line, new_line = line_pair(entry, side, lnum)
+    mappings[#mappings + 1] = {
+      buffer_line = lnum,
+      old_line = old_line,
+      new_line = new_line,
+    }
+  end
+  local cursor_old_line, cursor_new_line = line_pair(entry, side, cursor_line)
+
+  return {
+    file_path = entry.file_path,
+    display_path = entry.display_path,
+    layout = entry.layout,
+    side = side,
+    bufnr = bufnr,
+    cursor = {
+      line = cursor_line,
+      column = cursor_col,
+      old_line = cursor_old_line,
+      new_line = cursor_new_line,
+    },
+    range = { start_line = start_line, end_line = end_line },
+    selected_lines = selected_lines,
+    selected_text = table.concat(selected_lines, "\n"),
+    line_mappings = mappings,
+  }
+end
+
+local function capture_position(entry)
+  local win = vim.api.nvim_get_current_win()
+  local bufnr = vim.api.nvim_win_get_buf(win)
+  local _, current_entry, side = entry_for_buffer(bufnr)
+  if current_entry ~= entry then
+    win = entry.prop_win or entry.orig_win or entry.inline_win
+    if not win or not vim.api.nvim_win_is_valid(win) then return nil end
+    bufnr = vim.api.nvim_win_get_buf(win)
+    _, _, side = entry_for_buffer(bufnr)
+  end
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local old_line, new_line = line_pair(entry, side, cursor[1])
+  return { side = side, old_line = old_line, new_line = new_line, column = cursor[2] }
+end
+
+local function restore_position(entry, position)
+  if not position then return end
+  local target_side = position.side
+  if entry.layout ~= "inline" and target_side == "inline" then
+    if position.old_line and not position.new_line then
+      target_side = "original"
+    elseif position.new_line and not position.old_line then
+      target_side = "proposed"
+    else
+      target_side = entry.preferred_side or "proposed"
+    end
+  end
+
+  local target_win = entry.inline_win
+  local target_line = 1
+  if entry.layout == "inline" then
+    local wanted_index = position.side == "original" and 1 or 2
+    local wanted = wanted_index == 1 and position.old_line or position.new_line
+    if position.side == "inline" then
+      wanted_index = position.old_line and 1 or 2
+      wanted = position.old_line or position.new_line
+    end
+    for lnum, pair in ipairs(entry.inline_line_numbers or {}) do
+      if pair[wanted_index] == wanted then target_line = lnum break end
+    end
+  else
+    if target_side == "original" then
+      target_win = entry.orig_win
+      target_line = position.old_line or position.new_line or 1
+    else
+      target_win = entry.prop_win
+      target_line = position.new_line or position.old_line or 1
+    end
+    entry.preferred_side = target_side
+  end
+
+  if target_win and vim.api.nvim_win_is_valid(target_win) then
+    local max_line = vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(target_win))
+    local line = math.max(1, math.min(target_line, max_line))
+    local text = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(target_win), line - 1, line, false)[1] or ""
+    vim.api.nvim_set_current_win(target_win)
+    vim.api.nvim_win_set_cursor(target_win, { line, math.min(position.column or 0, #text) })
+  end
+end
+
+--- Toggle one active preview between inline and its original side-by-side layout.
+--- When file_path is omitted, the preview containing the current buffer is used.
+function M.toggle_layout(file_path)
+  local inferred_path, inferred_entry = entry_for_buffer(vim.api.nvim_get_current_buf())
+  local entry = file_path and active_diffs[file_path] or inferred_entry
+  if not entry then return false end
+
+  local current_was_target = inferred_entry == entry
+  local saved_win = vim.api.nvim_get_current_win()
+  local position = capture_position(entry)
+  if position and position.side ~= "inline" then entry.preferred_side = position.side end
+
+  local target_layout = entry.layout == "inline" and entry.side_layout or "inline"
+  destroy_render(entry)
+  render_entry(entry, target_layout)
+  restore_position(entry, position)
+
+  if not current_was_target and vim.api.nvim_win_is_valid(saved_win) then
+    vim.api.nvim_set_current_win(saved_win)
+  end
+  force_redraw()
+  return true
+end
+
+function M.show_diff(original_path, proposed_path, real_file_path, abs_file_path, action, backend)
+  local file_key = abs_file_path or real_file_path
+  if not file_key or file_key == "" then return end
+  local cfg = require("code-preview").config
+  local layout = layout_for_backend(cfg, backend)
+  log.info(log.fmt("show_diff: file=%s layout=%s backend=%s active=%d",
+    file_key, layout, backend or "nil", active_count()))
+
+  if active_diffs[file_key] then
+    log.debug(log.fmt("show_diff: re-edit detected, closing existing diff for %s", file_key))
+    M.close_for_file(file_key)
+  end
+
+  mark_change_and_reveal(abs_file_path, action)
+
+  local entry = {
+    file_path = file_key,
+    display_path = real_file_path or file_key,
+    backend = backend,
+    action = action,
+    original_layout = layout,
+    side_layout = layout == "inline" and "tab" or layout,
+    original_source_path = original_path,
+    proposed_source_path = proposed_path,
+    original_lines = vim.deepcopy(read_file_lines(original_path)),
+    proposed_lines = vim.deepcopy(read_file_lines(proposed_path)),
+    host_tab = vim.api.nvim_get_current_tabpage(),
+    host_win = vim.api.nvim_get_current_win(),
+    preferred_side = "proposed",
+  }
+  local _, _, _, line_numbers = build_inline_diff(entry.original_lines, entry.proposed_lines)
+  entry.line_numbers = line_numbers
+  active_diffs[file_key] = entry
+  render_entry(entry, layout)
   force_redraw()
 end
 
@@ -573,34 +833,9 @@ function M.close_for_file(file_path)
   -- to avoid neo-tree walking a stale tabpage id)
   pcall(function() require("code-preview.changes").clear(file_path) end)
 
-  -- Close the tab's windows
-  if entry.tab and vim.api.nvim_tabpage_is_valid(entry.tab) then
-    local wins = vim.api.nvim_tabpage_list_wins(entry.tab)
-    for _, win in ipairs(wins) do
-      if vim.api.nvim_win_is_valid(win) then
-        pcall(vim.api.nvim_win_call, win, function() vim.cmd('diffoff') end)
-      end
-    end
-    for _, win in ipairs(wins) do
-      if vim.api.nvim_win_is_valid(win) then
-        pcall(vim.api.nvim_win_close, win, true)
-      end
-    end
-  end
-
-  -- Delete buffers and clean up inline data
-  for _, buf in ipairs(entry.bufs or {}) do
-    buf_inline_data[buf] = nil
-    if vim.api.nvim_buf_is_valid(buf) then
-      pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    end
-  end
-
-  -- Clean up augroup
-  if entry.augroup then
-    pcall(vim.api.nvim_del_augroup_by_id, entry.augroup)
-  end
-
+  -- Tear down only this preview's windows and buffers. This matters for the
+  -- vsplit layout, whose tab may also contain normal windows or other previews.
+  destroy_render(entry)
   active_diffs[file_path] = nil
 
   -- Refresh neo-tree after the tab is fully gone so it doesn't walk a stale tabpage.
@@ -648,11 +883,7 @@ end
 
 --- Expose active_diffs for testing (read-only copy).
 function M._active_diffs()
-  local copy = {}
-  for k, v in pairs(active_diffs) do
-    copy[k] = { tab = v.tab, bufs = v.bufs }
-  end
-  return copy
+  return vim.deepcopy(active_diffs)
 end
 
 return M
